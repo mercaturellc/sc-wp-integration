@@ -1,0 +1,459 @@
+/**
+ * SC WP Plugin Admin Styles
+ */
+
+/* Main Container */
+.sc-settings-wrap {
+    max-width: 1200px;
+    margin: 20px 0;
+}
+
+/* Section Styling */
+.sc-settings-section {
+    background: #fff;
+    border: 1px solid #dcdcde;
+    border-radius: 4px;
+    box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+    margin-bottom: 20px;
+    padding: 20px;
+}
+
+.sc-settings-section h2 {
+    margin-top: 0;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #f0f0f1;
+    color: #1d2327;
+}
+
+/* Cards Layout */
+.sc-card-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin: 20px 0;
+}
+
+@media (max-width: 782px) {
+    .sc-card-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.sc-card {
+    background: #f8f9fa;
+    border: 1px solid #dcdcde;
+    border-radius: 4px;
+    padding: 16px;
+}
+
+.sc-card h3 {
+    margin-top: 0;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+}
+
+.sc-card h3 .dashicons {
+    margin-right: 5px;
+    color: #2271b1;
+}
+
+/* Status Indicators */
+.sc-status-dot {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    margin-right: 8px;
+}
+
+.sc-status-ok {
+    background-color: #46b450;
+}
+
+.sc-status-warning {
+    background-color: #ffba00;
+}
+
+.sc-status-error {
+    background-color: #dc3232;
+}
+
+/* Sync Info Table */
+.sc-sync-info {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.sc-sync-info td, 
+.sc-sync-info th {
+    padding: 12px;
+    text-align: left;
+    border-bottom: 1px solid #f0f0f1;
+}
+
+.sc-sync-info th {
+    font-weight: 600;
+    width: 35%;
+}
+
+/* Sync Buttons */
+.sc-sync-actions {
+    margin-top: 20px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+}
+
+.sc-button {
+    display: inline-flex;
+    align-items: center;
+    padding: 8px 14px;
+    background: #2271b1;
+    color: #fff;
+    border: none;
+    border-radius: 3px;
+    font-size: 13px;
+    line-height: normal;
+    text-decoration: none;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.sc-button:hover {
+    background: #135e96;
+    color: #fff;
+}
+
+.sc-button .dashicons {
+    margin-right: 5px;
+    font-size: 16px;
+    height: 16px;
+    width: 16px;
+}
+
+.sc-button.sc-button-secondary {
+    background: #f6f7f7;
+    color: #2c3338;
+    border: 1px solid #c3c4c7;
+}
+
+.sc-button.sc-button-secondary:hover {
+    background: #f0f0f1;
+    border-color: #8c8f94;
+}
+
+.sc-button.sc-button-danger {
+    background: #dc3232;
+}
+
+.sc-button.sc-button-danger:hover {
+    background: #b32d2e;
+}
+
+.sc-button.disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+/* Progress Bar */
+.sc-sync-progress {
+    margin-top: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.sc-sync-progress-bar {
+    background: #f6f7f7;
+    border: 1px solid #dcdcde;
+    border-radius: 3px;
+    overflow: hidden;
+    height: 20px;
+}
+
+.sc-sync-progress-bar-inner {
+    height: 100%;
+    background: #2271b1;
+    width: 0%;
+    transition: width 0.3s ease;
+}
+
+.sc-sync-progress-message {
+    font-size: 13px;
+    color: #50575e;
+}
+
+.hidden {
+    display: none;
+}
+
+/* Notifications */
+.sc-sync-notifications {
+    position: relative;
+    min-height: 40px;
+    margin: 15px 0;
+}
+
+.sc-notification {
+    position: relative;
+    padding: 12px 40px 12px 14px;
+    background: #fff;
+    border-left: 4px solid #2271b1;
+    box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+    margin-bottom: 10px;
+    animation: fadeIn 0.3s ease;
+}
+
+.sc-notification .dashicons {
+    margin-right: 8px;
+    font-size: 18px;
+    line-height: 1;
+    vertical-align: middle;
+}
+
+.sc-notification-success {
+    border-left-color: #46b450;
+}
+
+.sc-notification-error {
+    border-left-color: #dc3232;
+}
+
+.sc-notification-warning {
+    border-left-color: #ffba00;
+}
+
+.sc-notification-close {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    cursor: pointer;
+    color: #a7aaad;
+}
+
+.sc-notification-close:hover {
+    color: #d63638;
+}
+
+/* Animations */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* Help Section */
+.sc-help-section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 16px;
+}
+
+.sc-help-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 12px;
+    background: #f8f9fa;
+    border: 1px solid #dcdcde;
+    border-radius: 3px;
+}
+
+.sc-help-item .dashicons {
+    color: #2271b1;
+    margin-top: 2px;
+}
+
+/**
+ * Enhanced styles for the SC WP Plugin admin interface
+ */
+
+/* General status styles */
+.sc-sync-status-container {
+    display: flex;
+    margin-bottom: 20px;
+    border: 1px solid #ccd0d4;
+    background: #fff;
+    padding: 15px;
+    border-radius: 3px;
+}
+
+.sc-sync-status-block {
+    flex: 1;
+    padding: 0 15px;
+    border-right: 1px solid #eee;
+}
+
+.sc-sync-status-block:last-child {
+    border-right: none;
+}
+
+.sc-sync-status-label {
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: #23282d;
+}
+
+.sc-sync-status-value {
+    color: #646970;
+    display: flex;
+    align-items: center;
+}
+
+/* Status indicators */
+.sc-status-indicator {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    margin-right: 8px;
+}
+
+.sc-status-ok {
+    background-color: #00a32a;
+}
+
+.sc-status-warning {
+    background-color: #dba617;
+}
+
+.sc-status-error {
+    background-color: #d63638;
+}
+
+/* Progress bar */
+.sc-sync-progress {
+    margin-top: 20px;
+    margin-bottom: 20px;
+    border: 1px solid #ccd0d4;
+    background: #fff;
+    padding: 15px;
+    border-radius: 3px;
+}
+
+.sc-sync-progress.hidden {
+    display: none;
+}
+
+.sc-sync-progress-message {
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: #23282d;
+}
+
+.sc-sync-progress-bar {
+    height: 20px;
+    background-color: #f0f0f1;
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+}
+
+.sc-sync-progress-bar-inner {
+    height: 100%;
+    background-color: #2271b1;
+    width: 0;
+    transition: width 0.3s ease;
+}
+
+/* Button styles */
+.sc-sync-buttons {
+    display: flex;
+    gap: 10px;
+    margin-top: 20px;
+}
+
+.sc-sync-buttons button.disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+#sc-stop-sync {
+    background-color: #d63638;
+    border-color: #d63638;
+    color: #fff;
+}
+
+#sc-stop-sync:hover:not(.disabled) {
+    background-color: #a00;
+    border-color: #a00;
+}
+
+/* Notification styles */
+.sc-sync-notifications {
+    margin-top: 20px;
+}
+
+.sc-notification {
+    padding: 10px 15px;
+    border-radius: 3px;
+    margin-bottom: 10px;
+    position: relative;
+    animation: slideIn 0.3s ease;
+}
+
+.sc-notification-success {
+    background-color: #edfaef;
+    border-left: 4px solid #00a32a;
+}
+
+.sc-notification-error {
+    background-color: #fcf0f1;
+    border-left: 4px solid #d63638;
+}
+
+.sc-notification-warning {
+    background-color: #fcf9e8;
+    border-left: 4px solid #dba617;
+}
+
+.sc-notification-info {
+    background-color: #f0f6fc;
+    border-left: 4px solid #2271b1;
+}
+
+.sc-notification .dashicons {
+    margin-right: 8px;
+}
+
+.sc-notification-close {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    cursor: pointer;
+    color: #646970;
+}
+
+.sc-notification-close:hover {
+    color: #d63638;
+}
+
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Log styles */
+.sc-sync-log-container {
+    margin-top: 20px;
+}
+
+.sc-sync-log {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.sc-sync-log-entry {
+    margin-bottom: 5px;
+    font-family: monospace;
+    font-size: 12px;
+}
