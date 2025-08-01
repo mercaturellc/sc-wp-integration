@@ -14,7 +14,7 @@
  *
  * @wordpress-plugin
  * Plugin Name:       SelectConnect
- * Plugin URI:        https://aztecimport.com/wholesale/integration
+ * Plugin URI:        https://gitlab.com/mercature/sc-wp-integration
  * Description:       Select items from the catalog that you would like to list for sale on your woocommerce site using the manage my integration portal
  * Version:           1.0.0
  * Author:            Trent Mercer

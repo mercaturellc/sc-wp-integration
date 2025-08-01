@@ -1,1010 +1,1326 @@
 <?php
-/* SC_WP_Shop_Sync
-Sync WooCommerce Shop Inventory with Distributors
-uses: SC_API
-*/
 
+// Exit if accessed directly.
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * SC_WP_Shop_Sync - Distributor Sync for WooCommerce
+ * 
+ * Simple daily sync that efficiently syncs all WooCommerce categories
+ * Uses large API batches (1500-5000 items) to minimize API calls
+ * Optimized for shared hosting with minimal resource usage
+ */
 class SC_WP_Shop_Sync {
     private $api;
-    private $distributor_id = 'AZT';
-    private $batch_size = 50; // Reduced for better memory management
-    #private $max_sync_items = 100; // Limit total items per sync
-    private $categories_map = []; // Cache for category mapping
-    // Special categories
-    private $special_categories = [
-        'special' => '!',  // Special character for Specials category
-        'back_in_stock' => '^', // Special character for Back In Stock category
-        'new' => '@'      // Special character for New category
-    ];
-    
-    // Add server configuration check
-    public function __construct(SC_API $api, $distributor_id = null) {
+    private $batch_size = 2000; // Large batch size for efficiency
+    private $max_execution_time = 300; // 5 minutes max
+    private $image_lookup = null; // Cache for image filename lookups
+
+    public function __construct(SC_API $api) {
+        // Prevent frontend initialization to avoid slowdowns
+        if (!is_admin() && !wp_doing_ajax() && !wp_doing_cron() && !(defined('WP_CLI') && WP_CLI)) {
+            return;
+        }
+
         $this->api = $api;
-        $this->distributor_id = $distributor_id ?: get_option('sc_distributor_id', 'sc_distributor');
-
-        // Adjust batch size based on server memory
-        $memory_limit = $this->getServerMemoryLimit();
-        if ($memory_limit > 256) {
-            $this->batch_size = 100; // More memory available, process more at once
-        } elseif ($memory_limit < 128) {
-            $this->batch_size = 25; // Less memory, be more conservative
-        }
-    }
-
-    private function getServerMemoryLimit() {
-        $memory_limit = ini_get('memory_limit');
-        if (preg_match('/^(\d+)(.)$/', $memory_limit, $matches)) {
-            if ($matches[2] == 'M') {
-                return $matches[1]; // Return MB as integer
-            }
-        }
-        return 128; // Default assumption
+        
+        // Set batch size from options with reasonable limits
+        $configured_batch = get_option('sc_api_rows_per_request', 5000);
+        $this->batch_size = max(500, min(5000, intval($configured_batch)));
+        
+        error_log("SC Sync: Configured batch size from options: {$configured_batch}, Final batch size: {$this->batch_size}");
     }
 
     /**
-     * Validate configuration settings
-     * 
-     * @return array Status and message
+     * MAIN SYNC METHOD - Simplified and focused on categories
      */
-    public function validateConfig() {
-        $api_id = get_option('sc_api_id', '');
-        $errors = [];
-
-        if (empty($api_id)) {
-            $errors[] = 'API ID is not configured';
+    public function syncProducts($force_sync = false) {
+        $lock_key = 'sc_sync_lock';
+        if (!$force_sync && get_transient($lock_key)) {
+            return ['status' => false, 'message' => 'Sync already in progress', 'processed' => 0];
         }
 
-        if (empty($this->distributor_id)) {
-            $errors[] = 'Distributor ID is not configured';
-        }
+        set_transient($lock_key, time(), 600); // 10 minute lock
 
-        if (!function_exists('wc_get_product_id_by_sku')) {
-            $errors[] = 'WooCommerce is not active';
-        }
-
-        if (!empty($errors)) {
-            error_log('SC Sync: Configuration errors: ' . implode(', ', $errors));
-            return ['status' => false, 'message' => implode(', ', $errors)];
-        }
-
-        return ['status' => true, 'message' => 'Configuration valid'];
-    }
-
-    /**
-     * Synchronize products from SC API to WooCommerce
-     * 
-     * @param bool $full_sync Whether to perform a full sync ('F') or partial sync ('P')
-     * @param array $item_codes Optional list of SKUs for partial sync
-     * @param bool $force_sync Whether to force sync even if another sync is in progress
-     * @return array Status, message, and processed count
-     */
-    public function syncProducts($full_sync = false, $item_codes = [], $force_sync = false) {
         try {
-            $config = $this->validateConfig();
-            if (!$config['status']) {
-                return [
-                    'status' => false,
-                    'message' => $config['message'],
-                    'processed' => 0
-                ];
+            $start_time = time();
+            $total_processed = 0;
+            $total_created = 0;
+            $total_updated_categories = 0;
+            $total_skipped = 0;
+            $all_active_skus = []; // Track all active SKUs for discontinued product cleanup
+            
+            // Build image lookup cache for performance
+            $this->buildImageLookupCache();
+            
+            // PRIMARY STRATEGY: Sync ALL categories at once
+            $categories = $this->getWooCommerceCategories();
+            if (empty($categories)) {
+                delete_transient($lock_key);
+                return ['status' => false, 'message' => 'No WooCommerce categories found. Please create categories first.', 'processed' => 0];
             }
 
-            $api_id = get_option('sc_api_id', '');
-            $sync_mode = $full_sync ? 'F' : 'P';
+            error_log("SC Sync: Starting sync for ALL categories: " . implode(', ', $categories));
+            $result = $this->syncAllCategoriesComplete($categories);
+            $total_processed = $result['processed'];
+            $total_created = $result['created'];
+            $total_updated_categories = $result['category_updates'] ?? 0;
+            $total_skipped = $result['skipped'] ?? 0;
+            $all_active_skus = $result['active_skus'] ?? [];
 
-            // Check for ongoing sync to prevent race conditions
-            $lock_key = 'sc_sync_lock_' . $this->distributor_id;
-            if (get_transient($lock_key) && !$force_sync) {
-                return [
-                    'status' => false,
-                    'message' => 'Another sync is already in progress',
-                    'processed' => 0
-                ];
-            }
+            // Clean up discontinued products (simple approach)
+            $discontinued = $this->removeDiscontinuedProducts($all_active_skus);
 
-            // Set lock and record lock time
-            set_transient($lock_key, true, 900); // Lock for 15 minutes (increased from 5)
-            set_transient('sc_sync_lock_time_' . $this->distributor_id, time(), 900);
-
-            // Reset sync progress tracking
-            delete_transient('sc_sync_current_page');
-            delete_transient('sc_sync_total_pages');
-            delete_transient('sc_sync_items_processed');
-            delete_transient('sc_sync_items_expected');
-
-            error_log('SC Sync: Starting sync with API ID: ' . ($api_id ?: 'None') . ', Mode: ' . $sync_mode . ', Distributor: ' . $this->distributor_id);
-
-            // Get initial inventory data to get pagination info
-            $inventory_data = $this->getInventoryData($api_id, $sync_mode, $item_codes, 1);
-
-            // Process categories first if doing a full sync - ONLY using API-provided categories
-            if ($full_sync && !empty($inventory_data['categories'])) {
-                $this->setupAPICategories($inventory_data['categories']);
-            }
-
-            // Process all pages if multi-page response
-            $total_pages = isset($inventory_data['page_total']) ? intval($inventory_data['page_total']) : 1;
-            $total_items_processed = 0;
-            $total_items_expected = isset($inventory_data['item_total']) ? intval($inventory_data['item_total']) : 0;
-
-            // Store expected totals for tracking
-            set_transient('sc_sync_total_pages', $total_pages, 900);
-            set_transient('sc_sync_items_expected', $total_items_expected, 900);
-            set_transient('sc_sync_items_processed', 0, 900);
-
-            error_log("SC Sync: Total pages to process: {$total_pages}, Expected total items: {$total_items_expected}");
-
-            // Process each page
-            for ($page = 1; $page <= $total_pages; $page++) {
-                // Update current page for tracking
-                set_transient('sc_sync_current_page', $page, 900);
-
-                // Check if sync should be stopped
-                if (get_option('sc_stop_sync') === 'yes') {
-                    delete_option('sc_stop_sync');
-                    error_log("SC Sync: Sync operation terminated by admin at page {$page}");
-                    break;
-                }
-
-                // Get data for current page (reuse first page data if we already have it)
-                if ($page > 1) {
-                    $inventory_data = $this->getInventoryData($api_id, $sync_mode, $item_codes, $page);
-                    // Force garbage collection between page fetches
-                    if (function_exists('gc_collect_cycles')) {
-                        gc_collect_cycles();
-                    }
-                }
-
-                if (empty($inventory_data['items'])) {
-                    error_log("SC Sync: No items found on page {$page}");
-                    continue;
-                }
-
-                $items_processed = $this->processItemsBatch($inventory_data['items'], $full_sync);
-                $total_items_processed += $items_processed;
-
-                // Update total processed count
-                set_transient('sc_sync_items_processed', $total_items_processed, 900);
-
-                error_log("SC Sync: Processed page {$page}/{$total_pages}, items on this page: {$items_processed}, total processed: {$total_items_processed}");
-
-                // Prevent memory issues - more aggressive cleanup
-                $this->cleanupMemory();
-
-                // Optional: Add a small delay between pages to avoid API rate limits
-                if ($page < $total_pages) {
-                    sleep(1);
-                }
-            }
-
-            $sync_time = current_time('mysql');
-            update_option('sc_last_sync_time_' . $this->distributor_id, $sync_time);
-            update_option('sc_last_sync_count_' . $this->distributor_id, $total_items_processed);
-            update_option($full_sync ? 'sc_last_full_sync_time' : 'sc_last_stock_sync_time', $sync_time);
-
-            error_log('SC Sync: Completed processing ' . $total_items_processed . ' items for distributor ' . $this->distributor_id);
-
-            // Clean up transients used for progress tracking
-            delete_transient('sc_sync_current_page');
-            delete_transient('sc_sync_total_pages');
-            delete_transient('sc_sync_items_processed');
-            delete_transient('sc_sync_items_expected');
-
-            // Release the sync lock
+            // Update sync metadata
+            update_option('sc_last_sync_time', current_time('mysql'));
+            update_option('sc_last_sync_count', $total_processed);
+            update_option('sc_initial_sync_done', true);
+            
             delete_transient($lock_key);
-            delete_transient('sc_sync_lock_time_' . $this->distributor_id);
+
+            $elapsed = time() - $start_time;
+            $message = "Sync completed! Processed {$total_processed} items, created {$total_created} new products";
+            if ($total_updated_categories > 0) {
+                $message .= ", updated categories for {$total_updated_categories} products";
+            }
+            if ($total_skipped > 0) {
+                $message .= ", skipped {$total_skipped} items";
+            }
+            if ($discontinued > 0) {
+                $message .= ", removed {$discontinued} discontinued items";
+            }
+            $message .= " in {$elapsed} seconds.";
+
+            error_log("SC Sync: Complete sync finished - {$total_processed} processed, {$total_created} created, {$total_updated_categories} category updates, {$total_skipped} skipped, {$discontinued} discontinued in {$elapsed}s");
 
             return [
                 'status' => true,
-                'message' => 'Sync completed successfully',
-                'processed' => $total_items_processed,
-                'expected' => $total_items_expected
+                'message' => $message,
+                'processed' => $total_processed,
+                'created' => $total_created,
+                'category_updates' => $total_updated_categories,
+                'skipped' => $total_skipped,
+                'deleted' => $discontinued
             ];
+
         } catch (Exception $e) {
-            error_log('SC Sync: Exception during sync: ' . $e->getMessage());
-
-            // Clean up transients used for progress tracking
-            delete_transient('sc_sync_current_page');
-            delete_transient('sc_sync_total_pages');
-            delete_transient('sc_sync_items_processed');
-            delete_transient('sc_sync_items_expected');
-
-            // Ensure lock is released on error
             delete_transient($lock_key);
-            delete_transient('sc_sync_lock_time_' . $this->distributor_id);
+            error_log('SC Sync Error: ' . $e->getMessage());
+            return ['status' => false, 'message' => 'Sync failed: ' . $e->getMessage(), 'processed' => 0];
+        }
+    }
+
+    /**
+     * Sync ALL categories at once - much more efficient!
+     * Gets ALL items from ALL categories in one API call series
+     */
+    private function syncAllCategoriesComplete($categories) {
+        $api_id = get_option('sc_api_id');
+        if (empty($api_id)) {
+            return ['processed' => 0, 'created' => 0, 'category_updates' => 0, 'active_skus' => []];
+        }
+
+        $processed = 0;
+        $created = 0;
+        $category_updates = 0;
+        $total_skipped = 0;
+        $active_skus = [];
+        $page = 1;
+        $total_pages = 0;
+
+        error_log("SC Sync: Starting complete sync for ALL categories: " . implode(', ', $categories));
+
+        do {
+            error_log("SC Sync: Fetching page {$page} for ALL categories with batch size: {$this->batch_size}");
+            
+            $response = $this->api->productSync(
+                $api_id,
+                'F', // Full sync to get dimensions
+                '', // EMPTY SKU CSV - category-driven only
+                $categories, // ALL categories at once 
+                $page,
+                $this->batch_size
+            );
+
+            if (isset($response['error'])) {
+                error_log("SC API Error for ALL categories page {$page}: " . $response['error']);
+                break;
+            }
+
+            $item_catalog = $response['item_catalog'] ?? [];
+            $items = $item_catalog['items'] ?? [];
+            $page_total = $item_catalog['page_total'] ?? 1;
+            $item_total = $item_catalog['item_total'] ?? 0;
+            
+            // Log pagination info on first page
+            if ($page === 1) {
+                $total_pages = $page_total;
+                error_log("SC Sync: ALL categories have {$item_total} total items across {$page_total} pages");
+            }
+
+            if (empty($items)) {
+                if ($page === 1) {
+                    error_log("SC Sync: No items found for ANY categories");
+                }
+                break;
+            }
+
+            error_log("SC Sync: Processing page {$page}/{$page_total} for ALL categories: " . count($items) . " items");
+
+            // Collect active SKUs from this page
+            foreach ($items as $item) {
+                $sku = trim($item['item_code'] ?? '');
+                if (!empty($sku)) {
+                    $active_skus[] = $sku;
+                }
+            }
+
+            // Process items from this page - now handles simple primary category assignment
+            $page_result = $this->processItemsWithCategories($items);
+            $processed += $page_result['processed'];
+            $created += $page_result['created'];
+            $category_updates += $page_result['category_updates'];
+            $total_skipped += ($page_result['skipped'] ?? 0);
+
+            // Move to next page
+            $page++;
+            
+            // Safety check - don't go beyond reported page total
+            if ($page > $page_total) {
+                error_log("SC Sync: Reached final page ({$page_total}) for ALL categories");
+                break;
+            }
+
+            // Brief pause between pages
+            sleep(1);
+
+        } while (true);
+
+        error_log("SC Sync: ALL categories complete: {$processed} total processed, {$created} created, {$category_updates} category updates, {$total_skipped} skipped across " . ($page - 1) . " pages");
+
+        return ['processed' => $processed, 'created' => $created, 'category_updates' => $category_updates, 'skipped' => $total_skipped, 'active_skus' => $active_skus];
+    }
+
+    /**
+     * Process items from API response - now handles simple primary category assignment
+     * Uses the primary_category field from API
+     */
+    private function processItemsWithCategories($items) {
+        if (empty($items)) {
+            return ['processed' => 0, 'created' => 0, 'category_updates' => 0, 'skipped' => 0];
+        }
+
+        $processed = 0;
+        $created = 0;
+        $category_updates = 0;
+        $skipped = 0;
+        $skipped_reasons = [];
+
+        // Get existing products by SKU for efficient lookup
+        $skus = array_filter(array_map(function($item) {
+            return trim($item['item_code'] ?? '');
+        }, $items));
+
+        $existing_products = $this->getProductsBySKUs($skus);
+        
+        error_log("SC Sync: Processing " . count($items) . " items, found " . count($existing_products) . " existing products");
+
+        foreach ($items as $item) {
+            $sku = trim($item['item_code'] ?? '');
+            if (empty($sku)) {
+                error_log("SC Sync: Skipping item with empty SKU");
+                $skipped++;
+                $skipped_reasons['empty_sku'] = ($skipped_reasons['empty_sku'] ?? 0) + 1;
+                continue;
+            }
+
+            $product_data = $this->extractProductData($item);
+            
+            // Simple logic: Get the category this item should be in
+            $target_categories = $this->determineAllCategoriesFromItem($item);
+            
+            if (empty($target_categories)) {
+                $primary_cat = trim($item['primary_category'] ?? '');
+                error_log("SC Sync: SKIPPED - No valid categories found for SKU {$sku} (primary_category: '{$primary_cat}')");
+                $skipped++;
+                $key = !empty($primary_cat) ? "missing_category_{$primary_cat}" : 'no_primary_category';
+                $skipped_reasons[$key] = ($skipped_reasons[$key] ?? 0) + 1;
+                continue;
+            }
+
+            if (isset($existing_products[$sku])) {
+                // Update existing product
+                error_log("SC Sync: Updating existing product SKU: {$sku} with categories: " . implode(', ', $target_categories));
+                $update_result = $this->updateProductWithCategories($existing_products[$sku], $product_data, $target_categories);
+                if ($update_result['success']) {
+                    $processed++;
+                    if ($update_result['categories_updated']) {
+                        $category_updates++;
+                        error_log("SC Sync: Updated categories for existing product SKU: {$sku}");
+                    }
+                } else {
+                    error_log("SC Sync: Failed to update existing product SKU: {$sku}");
+                }
+            } else {
+                // Create new product
+                error_log("SC Sync: Creating new product SKU: {$sku} in categories: " . implode(', ', $target_categories));
+                $result = $this->createProductWithCategories($product_data, $target_categories);
+                if ($result) {
+                    $processed++;
+                    $created++;
+                    error_log("SC Sync: Successfully created product SKU: {$sku}");
+                } else {
+                    error_log("SC Sync: Failed to create new product SKU: {$sku} in categories: " . implode(', ', $target_categories));
+                }
+            }
+        }
+
+        // Log skip summary
+        if ($skipped > 0) {
+            error_log("SC Sync: SKIP SUMMARY - {$skipped} items skipped:");
+            foreach ($skipped_reasons as $reason => $count) {
+                error_log("SC Sync: - {$reason}: {$count} items");
+            }
+        }
+
+        error_log("SC Sync: Batch complete - Processed: {$processed}, Created: {$created}, Category Updates: {$category_updates}, Skipped: {$skipped}");
+        return ['processed' => $processed, 'created' => $created, 'category_updates' => $category_updates, 'skipped' => $skipped];
+    }
+
+    /**
+     * SIMPLE METHOD: Determine WooCommerce category from API primary_category
+     * 
+     * Logic:
+     * - Use primary_category from API
+     * - Only assign if that category exists in WooCommerce
+     * - Return array with single category or empty if doesn't exist
+     * 
+     * @param array $item API item data
+     * @return array Array with category name if valid, empty if not
+     */
+    private function determineAllCategoriesFromItem($item) {
+        $primary_category = trim($item['primary_category'] ?? '');
+        
+        $sku = trim($item['item_code'] ?? 'UNKNOWN');
+        error_log("SC Sync: Category determination for SKU {$sku} - primary_category: '{$primary_category}'");
+        
+        if (empty($primary_category)) {
+            error_log("SC Sync: No primary category for SKU {$sku}");
+            return [];
+        }
+        
+        if ($this->categoryExists($primary_category)) {
+            error_log("SC Sync: Using primary category '{$primary_category}' for SKU {$sku}");
+            return [$primary_category];
+        } else {
+            error_log("SC Sync: Primary category '{$primary_category}' does not exist in WooCommerce for SKU {$sku}");
+            return [];
+        }
+    }
+
+    /**
+     * Check if a category exists in WooCommerce
+     * @param string $category_name Category name to check
+     * @return bool True if category exists
+     */
+    private function categoryExists($category_name) {
+        if (empty($category_name)) {
+            return false;
+        }
+        
+        // Check by name first
+        $category = get_term_by('name', $category_name, 'product_cat');
+        if ($category) {
+            return true;
+        }
+        
+        // Check by slug
+        $category = get_term_by('slug', sanitize_title($category_name), 'product_cat');
+        if ($category) {
+            return true;
+        }
+        
+        return false;
+    }
+
+    /**
+     * BACKWARD COMPATIBILITY: Keep the old method name but use new logic
+     * @deprecated Use determineAllCategoriesFromItem instead
+     */
+    private function determineCategoryFromItem($item) {
+        $categories = $this->determineAllCategoriesFromItem($item);
+        return !empty($categories) ? $categories[0] : '';
+    }
+
+    /**
+     * BACKWARD COMPATIBILITY: Keep the old method name but redirect to new logic
+     * @deprecated Use processItemsWithMultipleCategories instead
+     */
+    private function processItemsWithSpecialCategories($items) {
+        return $this->processItemsWithMultipleCategories($items);
+    }
+
+    /**
+     * Create new WooCommerce product with multiple categories
+     */
+    private function createProductWithCategories($data, $category_names) {
+        try {
+            error_log("SC Sync: createProductWithCategories called for SKU: {$data['sku']}, Title: {$data['title']}, Categories: " . implode(', ', $category_names));
+            
+            $product_id = wp_insert_post([
+                'post_title' => $data['title'],
+                'post_content' => $data['description'],
+                'post_status' => 'publish',
+                'post_type' => 'product'
+            ]);
+
+            if (is_wp_error($product_id)) {
+                error_log('SC Create Product Error - wp_insert_post failed for SKU ' . $data['sku'] . ': ' . $product_id->get_error_message());
+                return false;
+            }
+
+            if (!$product_id) {
+                error_log('SC Create Product Error - wp_insert_post returned false/0 for SKU ' . $data['sku']);
+                return false;
+            }
+
+            error_log("SC Sync: wp_insert_post succeeded for SKU {$data['sku']}, product ID: {$product_id}");
+
+            // Set product type
+            $type_result = wp_set_object_terms($product_id, 'simple', 'product_type');
+            if (is_wp_error($type_result)) {
+                error_log('SC Create Product Error - product_type assignment failed for product ID ' . $product_id . ': ' . $type_result->get_error_message());
+            } else {
+                error_log("SC Sync: Set product type to 'simple' for product ID {$product_id}");
+            }
+
+            // Set product meta
+            error_log("SC Sync: Setting meta for new product ID {$product_id}");
+            $this->setProductMeta($product_id, $data);
+
+            // Assign to ALL categories
+            error_log("SC Sync: Assigning categories to new product ID {$product_id}");
+            $this->assignToMultipleCategories($product_id, $category_names);
+
+            // AUTO-ASSIGN IMAGES: Set product image if filename matches SKU
+            $this->assignProductImages($product_id, $data['sku']);
+
+            error_log("SC Sync: Successfully created and configured product ID: {$product_id}, SKU: {$data['sku']} with categories: " . implode(', ', $category_names));
+            return $product_id;
+
+        } catch (Exception $e) {
+            error_log('SC Create Product Exception for SKU ' . $data['sku'] . ': ' . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Update existing WooCommerce product with proper category management
+     */
+    private function updateProductWithCategories($product_id, $data, $target_categories) {
+        try {
+            error_log("SC Sync: updateProductWithCategories called for product ID {$product_id}, SKU: {$data['sku']}");
+            
+            // Update post if needed
+            if (!empty($data['title'])) {
+                $post_result = wp_update_post([
+                    'ID' => $product_id,
+                    'post_title' => $data['title'],
+                    'post_content' => $data['description']
+                ]);
+                
+                if (is_wp_error($post_result)) {
+                    error_log("SC Sync: wp_update_post failed for product ID {$product_id}: " . $post_result->get_error_message());
+                } else {
+                    error_log("SC Sync: wp_update_post succeeded for product ID {$product_id}");
+                }
+            }
+
+            // Update meta
+            error_log("SC Sync: Updating meta for product ID {$product_id}");
+            $this->setProductMeta($product_id, $data);
+
+            // Check if categories need updating
+            error_log("SC Sync: Updating categories for product ID {$product_id} with categories: " . implode(', ', $target_categories));
+            $categories_updated = $this->updateProductCategories($product_id, $target_categories);
+
+            // AUTO-ASSIGN IMAGES: Update product image if filename matches SKU
+            $this->assignProductImages($product_id, $data['sku']);
+
+            error_log("SC Sync: updateProductWithCategories completed for product ID {$product_id}, categories_updated: " . ($categories_updated ? 'true' : 'false'));
+            return ['success' => true, 'categories_updated' => $categories_updated];
+
+        } catch (Exception $e) {
+            error_log('SC Update Product Error for ID ' . $product_id . ': ' . $e->getMessage());
+            return ['success' => false, 'categories_updated' => false];
+        }
+    }
+
+    /**
+     * Update product categories - always assign to ensure proper categories
+     * Returns true if categories were assigned/updated
+     */
+    private function updateProductCategories($product_id, $target_categories) {
+        if (empty($target_categories)) {
+            error_log("SC Sync: No target categories provided for product ID {$product_id}");
+            return false;
+        }
+
+        // Get current categories for logging
+        $current_terms = wp_get_object_terms($product_id, 'product_cat', ['fields' => 'names']);
+        $current_categories = is_array($current_terms) ? $current_terms : [];
+        
+        error_log("SC Sync: Updating categories for product ID {$product_id} - Current: [" . implode(', ', $current_categories) . "] -> Target: [" . implode(', ', $target_categories) . "]");
+        
+        // Always update categories to ensure they're correct
+        $this->assignToMultipleCategories($product_id, $target_categories);
+        
+        // Verify the assignment worked
+        $new_terms = wp_get_object_terms($product_id, 'product_cat', ['fields' => 'names']);
+        $new_categories = is_array($new_terms) ? $new_terms : [];
+        
+        if (!empty($new_categories)) {
+            error_log("SC Sync: Successfully assigned categories to product ID {$product_id}: [" . implode(', ', $new_categories) . "]");
+            return true;
+        } else {
+            error_log("SC Sync: Failed to assign categories to product ID {$product_id}");
+            return false;
+        }
+    }
+
+    /**
+     * Assign product to multiple WooCommerce categories (only existing ones)
+     */
+    private function assignToMultipleCategories($product_id, $category_names) {
+        if (empty($category_names)) {
+            error_log("SC Sync: No categories provided for product ID: {$product_id}");
+            return;
+        }
+
+        $category_ids = [];
+        
+        foreach ($category_names as $category_name) {
+            if (empty($category_name)) continue;
+            
+            $category = get_term_by('name', $category_name, 'product_cat');
+            if (!$category) {
+                $category = get_term_by('slug', sanitize_title($category_name), 'product_cat');
+            }
+            
+            if ($category) {
+                $category_ids[] = $category->term_id;
+                error_log("SC Sync: Found category '{$category_name}' with ID {$category->term_id} for product ID: {$product_id}");
+            } else {
+                error_log("SC Sync: Category '{$category_name}' not found in WooCommerce for product ID: {$product_id} (skipping)");
+            }
+        }
+
+        if (!empty($category_ids)) {
+            // Remove duplicates and assign all categories
+            $category_ids = array_unique($category_ids);
+            error_log("SC Sync: Attempting to assign product ID {$product_id} to category IDs: " . implode(', ', $category_ids));
+            
+            $result = wp_set_object_terms($product_id, $category_ids, 'product_cat');
+            
+            if (is_wp_error($result)) {
+                error_log("SC Sync: wp_set_object_terms failed for product ID {$product_id}: " . $result->get_error_message());
+            } else {
+                error_log("SC Sync: wp_set_object_terms returned: " . print_r($result, true));
+                error_log("SC Sync: Successfully assigned product ID {$product_id} to " . count($category_ids) . " categories: " . implode(', ', $category_names));
+            }
+        } else {
+            error_log("SC Sync: No valid existing categories found for product ID: {$product_id}");
+        }
+    }
+
+    /**
+     * BACKWARD COMPATIBILITY: Keep the old single-category method
+     * @deprecated Use assignToMultipleCategories instead
+     */
+    private function assignToCategory($product_id, $category_name) {
+        $this->assignToMultipleCategories($product_id, [$category_name]);
+    }
+
+    /**
+     * Create new WooCommerce product (backward compatibility)
+     * @deprecated Use createProductWithCategories instead
+     */
+    private function createProduct($data, $category_name) {
+        return $this->createProductWithCategories($data, [$category_name]);
+    }
+
+    /**
+     * Update existing WooCommerce product (backward compatibility)
+     * @deprecated Use updateProductWithCategories instead
+     */
+    private function updateProduct($product_id, $data, $category_name) {
+        $result = $this->updateProductWithCategories($product_id, $data, [$category_name]);
+        return $result['success'];
+    }
+
+    /**
+     * NEW METHOD: Fix category assignments for existing products
+     * This can be run separately to update existing products with correct categories
+     */
+    public function fixExistingProductCategories($limit = 100) {
+        global $wpdb;
+        
+        // Get existing products that need category updates
+        $products = $wpdb->get_results($wpdb->prepare("
+            SELECT p.ID as product_id, pm.meta_value as sku
+            FROM {$wpdb->posts} p
+            INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_sku'
+            WHERE p.post_type = 'product'
+            AND p.post_status = 'publish'
+            AND pm.meta_value != ''
+            ORDER BY p.ID DESC
+            LIMIT %d
+        ", $limit));
+
+        if (empty($products)) {
+            return ['status' => false, 'message' => 'No products found to update', 'processed' => 0];
+        }
+
+        // Get SKUs for API call
+        $skus = array_map(function($product) {
+            return $product->sku;
+        }, $products);
+
+        // Fetch current data from API
+        $api_id = get_option('sc_api_id');
+        if (empty($api_id)) {
+            return ['status' => false, 'message' => 'No API ID configured', 'processed' => 0];
+        }
+
+        try {
+            $sku_csv = implode(',', array_slice($skus, 0, 100)); // Limit API call
+            
+            $response = $this->api->productSync(
+                $api_id,
+                'P', // Partial sync for category info
+                $sku_csv,
+                [],
+                1,
+                500
+            );
+
+            if (isset($response['error'])) {
+                return ['status' => false, 'message' => 'API Error: ' . $response['error'], 'processed' => 0];
+            }
+
+            $items = $response['item_catalog']['items'] ?? [];
+            if (empty($items)) {
+                return ['status' => false, 'message' => 'No items returned from API', 'processed' => 0];
+            }
+
+            // Create SKU to item mapping
+            $item_by_sku = [];
+            foreach ($items as $item) {
+                $sku = trim($item['item_code'] ?? '');
+                if (!empty($sku)) {
+                    $item_by_sku[$sku] = $item;
+                }
+            }
+
+            $updated = 0;
+            foreach ($products as $product) {
+                if (!isset($item_by_sku[$product->sku])) {
+                    continue; // SKU not found in API response
+                }
+
+                $item = $item_by_sku[$product->sku];
+                $target_categories = $this->determineAllCategoriesFromItem($item);
+                
+                if (!empty($target_categories)) {
+                    $categories_updated = $this->updateProductCategories($product->product_id, $target_categories);
+                    if ($categories_updated) {
+                        $updated++;
+                        error_log("SC Sync: Fixed categories for SKU {$product->sku} - assigned to: " . implode(', ', $target_categories));
+                    }
+                }
+            }
 
             return [
-                'status' => false,
-                'message' => 'Sync failed: ' . $e->getMessage(),
-                'processed' => $total_items_processed ?? 0
+                'status' => true,
+                'message' => "Updated categories for {$updated} products out of " . count($products) . " checked",
+                'processed' => count($products),
+                'updated' => $updated
             ];
+
+        } catch (Exception $e) {
+            error_log('SC Fix Categories Error: ' . $e->getMessage());
+            return ['status' => false, 'message' => 'Error: ' . $e->getMessage(), 'processed' => 0];
         }
     }
+
+    // ... (rest of the methods remain the same as in the original code)
 
     /**
-     * Clean up memory aggressively
+     * Simple discontinued products removal
+     * Uses a conservative approach to avoid accidentally deleting products
      */
-    private function cleanupMemory() {
-        wc_delete_product_transients();
-        wp_cache_flush();
+    private function removeDiscontinuedProducts($active_skus = []) {
         global $wpdb;
-        $wpdb->flush();
         
-        // Force PHP garbage collection if available
-        if (function_exists('gc_collect_cycles')) {
-            gc_collect_cycles();
+        // Get products that haven't been synced in the last 7 days
+        $stale_threshold = date('Y-m-d H:i:s', strtotime('-7 days'));
+        
+        $stale_products = $wpdb->get_results($wpdb->prepare("
+            SELECT p.ID as product_id, pm1.meta_value as sku
+            FROM {$wpdb->posts} p
+            INNER JOIN {$wpdb->postmeta} pm1 ON p.ID = pm1.post_id AND pm1.meta_key = '_sku'
+            LEFT JOIN {$wpdb->postmeta} pm2 ON p.ID = pm2.post_id AND pm2.meta_key = '_sc_last_sync'
+            WHERE p.post_type = 'product'
+            AND p.post_status = 'publish'
+            AND pm1.meta_value != ''
+            AND (pm2.meta_value IS NULL OR pm2.meta_value < %s)
+            LIMIT 50
+        ", $stale_threshold));
+
+        if (empty($stale_products)) {
+            return 0;
         }
-    }
 
-    private function processItemsBatch($items, $full_sync) {
-        $items_processed = 0;
-        $total_items = count($items);
-        $failed_items = [];
-
-        // Process items in batches
-        for ($offset = 0; $offset < $total_items; $offset += $this->batch_size) {
-            global $wpdb;
-            $wpdb->query('START TRANSACTION');
-
-            try {
-                $batch = array_slice($items, $offset, $this->batch_size);
-                $batch_success = true;
-
-                foreach ($batch as $item) {
-                    // Track specifically problematic items
-                    $tracking_skus = ['D4751A']; // Add other problematic SKUs
-                    $is_tracked = in_array($item['sku'], $tracking_skus);
-
-                    if ($is_tracked) {
-                        error_log("SC Sync: Processing tracked SKU {$item['sku']}");
-                    }
-
-                    // Robust SKU check
-                    $product_id = $this->getProductIdBySku($item['sku']);
-
-                    if (!$product_id && $full_sync) {
-                        $product_id = $this->createProduct($item);
-                        if (!$product_id) {
-                            error_log("SC Sync: Failed to create product SKU {$item['sku']}");
-                            $failed_items[] = $item['sku'];
-                            $batch_success = false;
-                            continue;
-                        }
-                    }
-
-                    if ($product_id) {
-                        $this->updateProduct($product_id, $item, $full_sync);
-                        $items_processed++;
-
-                        if ($is_tracked) {
-                            error_log("SC Sync: Successfully processed {$item['sku']} with ID {$product_id}");
-                        }
-                    } else {
-                        if ($is_tracked) {
-                            error_log("SC Sync: Skipped processing {$item['sku']} - no product ID");
-                        }
-                        $failed_items[] = $item['sku'];
-                    }
-                }
-
-                // Commit only if all items in the batch succeeded
-                if ($batch_success) {
-                    $wpdb->query('COMMIT');
-                } else {
-                    // Individual items have already been logged, no need to roll back everything
-                    $wpdb->query('COMMIT');
-                }
-            } catch (Exception $e) {
-                $wpdb->query('ROLLBACK');
-                error_log("SC Sync: Batch processing exception: " . $e->getMessage());
+        $deleted = 0;
+        foreach ($stale_products as $product) {
+            // If we have active SKUs list, double-check that this SKU is not in it
+            if (!empty($active_skus) && in_array($product->sku, $active_skus)) {
+                continue; // Skip deletion if SKU is still active
             }
 
-            // Clear memory within the batch
-            unset($batch);
-            $this->cleanupMemory();
+            // Delete the product
+            if (wp_delete_post($product->product_id, true)) {
+                $deleted++;
+                error_log("SC Sync: Deleted discontinued product SKU: {$product->sku}");
+            }
         }
 
-        // Log all failed items at the end
-        if (!empty($failed_items)) {
-            error_log("SC Sync: Failed to process these SKUs: " . implode(', ', $failed_items));
-            // Store for reporting
-            update_option('sc_sync_failed_items', array_slice($failed_items, 0, 100)); // Store limited number
-        }
-
-        return $items_processed;
+        return $deleted;
     }
 
     /**
-     * Robustly get product ID by SKU with direct database query
-     * 
-     * @param string $sku Product SKU
-     * @return int|false Product ID or false
+     * Sync a single category efficiently using large batches
+     */
+    private function syncCategory($category_name) {
+        $api_id = get_option('sc_api_id');
+        if (empty($api_id)) {
+            return ['processed' => 0, 'created' => 0, 'active_skus' => []];
+        }
+
+        $processed = 0;
+        $created = 0;
+        $active_skus = [];
+        $page = 1;
+
+        do {
+            // Get products from API with large batch size
+            $response = $this->api->productSync(
+                $api_id,
+                'F', // Full sync to get dimensions
+                '', // No SKU CSV - category-driven
+                [$category_name],
+                $page,
+                $this->batch_size
+            );
+
+            if (isset($response['error'])) {
+                error_log("SC API Error for {$category_name}: " . $response['error']);
+                break;
+            }
+
+            $items = $response['item_catalog']['items'] ?? [];
+            if (empty($items)) {
+                break;
+            }
+
+            // Track active SKUs
+            foreach ($items as $item) {
+                $sku = trim($item['item_code'] ?? '');
+                if (!empty($sku)) {
+                    $active_skus[] = $sku;
+                }
+            }
+
+            // Process all items in this batch - now uses multiple categories logic
+            $batch_result = $this->processItemsWithMultipleCategories($items);
+            $processed += $batch_result['processed'];
+            $created += $batch_result['created'];
+
+            // Check if we have more pages
+            $page_total = $response['item_catalog']['page_total'] ?? 1;
+            $page++;
+            
+            if ($page > $page_total) {
+                break;
+            }
+
+            // Brief pause to be gentle on shared hosting
+            sleep(1);
+            
+        } while (true);
+
+        return ['processed' => $processed, 'created' => $created, 'active_skus' => $active_skus];
+    }
+
+    /**
+     * Sync existing products by their current SKUs (ensures no products are missed)
+     */
+    private function syncExistingProducts($time_limit) {
+        $start_time = time();
+        $processed = 0;
+        $active_skus = [];
+        
+        // Get all existing product SKUs in batches
+        global $wpdb;
+        $offset = 0;
+        $batch_size = 500; // SKUs per batch
+        
+        do {
+            if ((time() - $start_time) > ($time_limit - 10)) {
+                break; // Stop if running out of time
+            }
+            
+            // Get batch of existing SKUs
+            $existing_skus = $wpdb->get_col($wpdb->prepare("
+                SELECT DISTINCT pm.meta_value
+                FROM {$wpdb->postmeta} pm
+                INNER JOIN {$wpdb->posts} p ON pm.post_id = p.ID
+                WHERE pm.meta_key = '_sku'
+                AND pm.meta_value != ''
+                AND p.post_type = 'product'
+                AND p.post_status = 'publish'
+                ORDER BY p.ID
+                LIMIT %d OFFSET %d
+            ", $batch_size, $offset));
+            
+            if (empty($existing_skus)) {
+                break; // No more SKUs
+            }
+            
+            // Sync this batch of SKUs
+            $result = $this->syncSKUBatch($existing_skus);
+            $processed += $result['processed'];
+            $active_skus = array_merge($active_skus, $result['active_skus']);
+            
+            $offset += $batch_size;
+            sleep(1); // Brief pause
+            
+        } while (true);
+        
+        return ['processed' => $processed, 'active_skus' => $active_skus];
+    }
+
+    /**
+     * Sync a batch of SKUs via API
+     */
+    private function syncSKUBatch($skus) {
+        $api_id = get_option('sc_api_id');
+        if (empty($api_id) || empty($skus)) {
+            return ['processed' => 0, 'active_skus' => []];
+        }
+
+        try {
+            $sku_csv = implode(',', array_slice($skus, 0, 100)); // Limit to 100 SKUs per API call
+            
+            $response = $this->api->productSync(
+                $api_id,
+                'F', // Full sync to get dimensions
+                $sku_csv, // Use SKU CSV
+                [], // No categories
+                1,
+                500 // Large batch size
+            );
+
+            if (isset($response['error'])) {
+                error_log("SC API Error for SKU batch: " . $response['error']);
+                return ['processed' => 0, 'active_skus' => []];
+            }
+
+            $items = $response['item_catalog']['items'] ?? [];
+            $active_skus = [];
+            
+            // Track which SKUs are active
+            foreach ($items as $item) {
+                $sku = trim($item['item_code'] ?? '');
+                if (!empty($sku)) {
+                    $active_skus[] = $sku;
+                }
+            }
+            
+            // Process items - now uses simple category logic
+            $result = $this->processItemsWithCategories($items);
+            
+            return ['processed' => $result['processed'], 'active_skus' => $active_skus];
+            
+        } catch (Exception $e) {
+            error_log('SC SKU Batch Sync Error: ' . $e->getMessage());
+            return ['processed' => 0, 'active_skus' => []];
+        }
+    }
+
+    /**
+     * Safely remove discontinued products using API verification
+     */
+    private function removeDiscontinuedProductsSafely($confirmed_active_skus) {
+        global $wpdb;
+        
+        // Get products not seen in recent sync
+        $stale_threshold = date('Y-m-d H:i:s', strtotime('-7 days')); // More conservative - 1 week
+        
+        $stale_skus = $wpdb->get_col($wpdb->prepare("
+            SELECT DISTINCT pm1.meta_value as sku
+            FROM {$wpdb->posts} p
+            INNER JOIN {$wpdb->postmeta} pm1 ON p.ID = pm1.post_id AND pm1.meta_key = '_sku'
+            LEFT JOIN {$wpdb->postmeta} pm2 ON p.ID = pm2.post_id AND pm2.meta_key = '_sc_last_sync'
+            WHERE p.post_type = 'product'
+            AND p.post_status = 'publish'
+            AND pm1.meta_value != ''
+            AND (pm2.meta_value IS NULL OR pm2.meta_value < %s)
+            LIMIT 50
+        ", $stale_threshold));
+
+        if (empty($stale_skus)) {
+            return 0;
+        }
+
+        // Double-check with API before deleting
+        $api_id = get_option('sc_api_id');
+        if (empty($api_id)) {
+            return 0;
+        }
+
+        try {
+            $sku_csv = implode(',', $stale_skus);
+            
+            $response = $this->api->productSync(
+                $api_id,
+                'P', // Partial sync for verification
+                $sku_csv,
+                [],
+                1,
+                100
+            );
+
+            $api_active_skus = [];
+            if (!isset($response['error']) && isset($response['item_catalog']['items'])) {
+                foreach ($response['item_catalog']['items'] as $item) {
+                    $sku = trim($item['item_code'] ?? '');
+                    if (!empty($sku)) {
+                        $api_active_skus[] = $sku;
+                    }
+                }
+            }
+
+            // Only delete SKUs that are confirmed not in API response
+            $truly_discontinued = array_diff($stale_skus, $api_active_skus);
+            
+            $deleted = 0;
+            foreach ($truly_discontinued as $sku) {
+                $product_id = $this->getProductIdBySku($sku);
+                if ($product_id && wp_delete_post($product_id, true)) {
+                    $deleted++;
+                }
+            }
+
+            return $deleted;
+            
+        } catch (Exception $e) {
+            error_log('SC Discontinued Check Error: ' . $e->getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Get product ID by SKU
      */
     private function getProductIdBySku($sku) {
-        // First try WooCommerce function
-        $product_id = wc_get_product_id_by_sku($sku);
-        if ($product_id) {
-            return $product_id;
-        }
-
-        // Fallback to direct database query to bypass cache
         global $wpdb;
-        $product_id = $wpdb->get_var($wpdb->prepare(
-            "SELECT post_id FROM $wpdb->postmeta 
-            WHERE meta_key = '_sku' 
-            AND meta_value = %s 
-            LIMIT 1",
-            $sku
-        ));
-
-        if ($product_id) {
-            error_log('SC Sync: Found product ID ' . $product_id . ' for SKU ' . $sku . ' via database query');
-            return (int)$product_id;
-        }
-
-        return false;
+        return $wpdb->get_var($wpdb->prepare("
+            SELECT post_id FROM {$wpdb->postmeta}
+            WHERE meta_key = '_sku' AND meta_value = %s
+            LIMIT 1
+        ", $sku));
     }
 
     /**
-     * Just update stock levels and prices (partial sync)
-     * 
-     * @param array $item_codes Optional list of SKUs to sync
-     * @param bool $force_sync Whether to force sync even if another sync is in progress
-     * @return array Status, message, and processed count
+     * Build image lookup cache for efficient SKU-to-image matching
+     * Performance optimized: builds once per sync, used for all products
      */
-    public function syncInventoryStockOnly($item_codes = [], $force_sync = false) {
-        return $this->syncProducts(false, $item_codes, $force_sync);
+    private function buildImageLookupCache() {
+        if ($this->image_lookup !== null) {
+            return; // Already cached
+        }
+
+        global $wpdb;
+        
+        // Get all images from media library with their filenames
+        $images = $wpdb->get_results("
+            SELECT p.ID as attachment_id, p.post_title, p.guid, pm.meta_value as filename
+            FROM {$wpdb->posts} p
+            LEFT JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_wp_attached_file'
+            WHERE p.post_type = 'attachment'
+            AND p.post_mime_type LIKE 'image/%'
+            ORDER BY p.ID DESC
+        ");
+
+        $this->image_lookup = [];
+        
+        foreach ($images as $image) {
+            if (empty($image->filename)) continue;
+            
+            // Extract filename without path and extension
+            $filename = basename($image->filename);
+            $name_without_ext = pathinfo($filename, PATHINFO_FILENAME);
+            
+            // Store both with and without extension for flexible matching
+            $this->image_lookup[strtolower($name_without_ext)] = $image->attachment_id;
+            $this->image_lookup[strtolower($filename)] = $image->attachment_id;
+            
+            // Also try the post_title in case it matches SKU
+            if (!empty($image->post_title)) {
+                $this->image_lookup[strtolower($image->post_title)] = $image->attachment_id;
+            }
+        }
+
+        error_log("SC Sync: Built image lookup cache with " . count($this->image_lookup) . " entries");
     }
 
-    public function getInventoryData($api_id, $sync_mode, $item_codes = [], $page = 1) {
-        $data = [
-            'items' => [], 
-            'categories' => [],
-            'page_num' => $page,
-            'page_total' => 1,
-            'item_total' => 0
+    /**
+     * Assign product images based on SKU matching
+     * Looks for images with filenames matching the product SKU
+     */
+    private function assignProductImages($product_id, $sku) {
+        if (empty($sku) || empty($this->image_lookup)) {
+            return;
+        }
+
+        $sku_lower = strtolower($sku);
+        $attachment_id = null;
+
+        // Try different variations of SKU matching
+        $variations = [
+            $sku_lower,
+            $sku_lower . '.jpg',
+            $sku_lower . '.jpeg', 
+            $sku_lower . '.png',
+            $sku_lower . '.webp',
+            str_replace(['-', '_', ' '], '', $sku_lower), // Remove separators
+            str_replace(['-', '_', ' '], '', $sku_lower) . '.jpg'
         ];
-        
-        $max_retries = 3;
-        $retry_count = 0;
-        $response = null;
-    
-        while ($retry_count < $max_retries) {
-            try {
-                $response = $this->api->productSync($api_id, $sync_mode, $item_codes, $page);
-                if (!empty($response) && !isset($response['error'])) {
-                    break;
-                }
-            } catch (Exception $e) {
-                error_log('SC Sync: API call failed: ' . $e->getMessage());
-            }
-            $retry_count++;
-            error_log("SC Sync: Retry $retry_count for sync_mode $sync_mode, page $page due to " . (isset($response['error']) ? $response['error'] : 'empty response'));
-            sleep(2);
-        }
-    
-        if (empty($response) || isset($response['error'])) {
-            error_log('SC Sync: Failed to fetch data: ' . (isset($response['error']) ? $response['error'] : 'Empty response'));
-            return $data;
-        }
-    
-        // Extract distributor_id from API response (adjust the key based on actual response structure)
-        if (isset($response['distributor_id'])) {
-            $this->distributor_id = sanitize_text_field($response['distributor_id']);
-            error_log('SC Sync: Updated distributor_id to ' . $this->distributor_id . ' from API response');
-        } else {
-            error_log('SC Sync: No distributor_id found in API response, using default: ' . $this->distributor_id);
-        }
-    
-        // Extract pagination information
-        if (!empty($response['item_catalog'])) {
-            $data['page_num'] = isset($response['item_catalog']['page_num']) ? intval($response['item_catalog']['page_num']) : 1;
-            $data['page_total'] = isset($response['item_catalog']['page_total']) ? intval($response['item_catalog']['page_total']) : 1;
-            $data['item_total'] = isset($response['item_catalog']['item_total']) ? intval($response['item_catalog']['item_total']) : 0;
-        }
-    
-        // Extract categories
-        if (!empty($response['item_catalog']['categories'])) {
-            $data['categories'] = array_map('sanitize_text_field', $response['item_catalog']['categories']);
-            error_log('SC Sync: Retrieved ' . count($data['categories']) . ' categories from API');
-        }
-    
-        // Extract items
-        if (!empty($response['item_catalog']['items'])) {
-            foreach ($response['item_catalog']['items'] as $item) {
-                if (empty($item['esm_code'])) {
-                    error_log('SC Sync: Skipping item with no esm_code');
-                    continue;
-                }
 
-                $data['items'][] = [
-                    'sku'          => sanitize_text_field($item['esm_code']), // Confirm this mapping is correct
-                    'stock'        => isset($item['stock_status']) ? intval($item['stock_status']) : 0,
-                    'price'        => isset($item['us_price']) ? floatval($item['us_price']) : 0,
-                    'retail_price' => isset($item['retail_price']) ? floatval($item['retail_price']) : 0,
-                    'description'  => sanitize_textarea_field($item['esm_description'] ?? ''),
-                    'image_url'    => "https://aztecimport.com/static/photos/{$item['esm_code']}.png",
-                    'catalog'      => isset($item['catalog']) ? sanitize_text_field($item['catalog']) : '',
-                    'catalog_page' => isset($item['catalog_page']) ? sanitize_text_field($item['catalog_page']) : '',
-                    'dimensions'   => isset($item['dimmensions']) ? sanitize_text_field($item['dimmensions']) : '',
-                    'item_uom'     => isset($item['esm_uom']) ? sanitize_text_field($item['esm_uom']) : '',
-                    'category'     => isset($item['primary_category']) ? sanitize_text_field($item['primary_category']) : ''
-                ];
+        foreach ($variations as $variation) {
+            if (isset($this->image_lookup[$variation])) {
+                $attachment_id = $this->image_lookup[$variation];
+                break;
             }
-        } else {
-            error_log('SC Sync: No items found in item_catalog');
         }
-    
-        error_log('SC Sync: Retrieved ' . count($data['items']) . ' items from API on page ' . $data['page_num'] . ' of ' . $data['page_total']);
-        return $data;
-    }
 
-    /**
-     * Setup categories based on the API response while also ensuring special categories exist
-     * 
-     * @param array $categories List of category names from API
-     */
-    private function setupAPICategories($categories) {
-        // Reset categories map to ensure we only use what comes from the API and special categories
-        $this->categories_map = [];
-        
-        error_log('SC Sync: Setting up ' . count($categories) . ' categories from API');
-        
-        // First, ensure our special categories exist
-        $this->ensureSpecialCategoriesExist();
-        
-        // Then setup all the regular categories from the API
-        foreach ($categories as $category) {
-            $term = term_exists($category, 'product_cat');
+        if ($attachment_id) {
+            // Check if product already has this image to avoid unnecessary updates
+            $current_image_id = get_post_meta($product_id, '_thumbnail_id', true);
             
-            if (!$term) {
-                $term = wp_insert_term($category, 'product_cat', [
-                    'description' => "Products from category {$category}"
-                ]);
+            if ($current_image_id != $attachment_id) {
+                // Set as featured image
+                set_post_thumbnail($product_id, $attachment_id);
                 
-                if (is_wp_error($term)) {
-                    error_log('SC Sync: Failed to create category ' . $category . ': ' . $term->get_error_message());
-                    continue;
+                // Also add to product gallery if not already there
+                $gallery_ids = get_post_meta($product_id, '_product_image_gallery', true);
+                $gallery_array = !empty($gallery_ids) ? explode(',', $gallery_ids) : [];
+                
+                if (!in_array($attachment_id, $gallery_array)) {
+                    array_unshift($gallery_array, $attachment_id); // Add to beginning
+                    update_post_meta($product_id, '_product_image_gallery', implode(',', array_unique($gallery_array)));
                 }
+                
+                error_log("SC Sync: Assigned image (ID: {$attachment_id}) to product SKU: {$sku}");
             }
-            
-            // Store the term ID for later use
-            $this->categories_map[$category] = is_array($term) ? $term['term_id'] : $term;
-            error_log('SC Sync: Category ' . $category . ' setup with ID ' . $this->categories_map[$category]);
         }
-        
-        // Store categories for this specific distributor
-        update_option('sc_distributor_categories_' . $this->distributor_id, $this->categories_map);
     }
-    
+
     /**
-     * Ensure special categories (Specials, Back In Stock, New) exist
+     * MANUAL IMAGE ASSIGNMENT: Assign images to all existing products (one-time operation)
+     * This can be run separately to retroactively assign images to existing products
      */
-    private function ensureSpecialCategoriesExist() {
-        $special_category_names = [
-            'special' => 'Specials',
-            'back_in_stock' => 'Back In Stock', 
-            'new' => 'New'
+    public function assignImagesToAllProducts($limit = 100) {
+        $this->buildImageLookupCache();
+        
+        if (empty($this->image_lookup)) {
+            return ['status' => false, 'message' => 'No images found in media library', 'processed' => 0];
+        }
+
+        global $wpdb;
+        
+        // Get products without featured images
+        $products = $wpdb->get_results($wpdb->prepare("
+            SELECT p.ID as product_id, pm.meta_value as sku
+            FROM {$wpdb->posts} p
+            INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_sku'
+            LEFT JOIN {$wpdb->postmeta} pm2 ON p.ID = pm2.post_id AND pm2.meta_key = '_thumbnail_id'
+            WHERE p.post_type = 'product'
+            AND p.post_status = 'publish'
+            AND pm.meta_value != ''
+            AND (pm2.meta_value IS NULL OR pm2.meta_value = '')
+            LIMIT %d
+        ", $limit));
+
+        $assigned = 0;
+        foreach ($products as $product) {
+            $this->assignProductImages($product->product_id, $product->sku);
+            
+            // Check if image was actually assigned
+            if (get_post_meta($product->product_id, '_thumbnail_id', true)) {
+                $assigned++;
+            }
+        }
+
+        return [
+            'status' => true,
+            'message' => "Assigned images to {$assigned} products out of " . count($products) . " checked",
+            'processed' => count($products),
+            'assigned' => $assigned
         ];
+    }
+
+    /**
+     * Set WooCommerce product meta data
+     */
+    private function setProductMeta($product_id, $data) {
+        error_log("SC Sync: Setting meta for product ID {$product_id}, SKU: {$data['sku']}");
         
-        foreach ($special_category_names as $key => $category_name) {
-            $term = term_exists($category_name, 'product_cat');
+        $meta = [
+            '_sku' => $data['sku'],
+            '_manage_stock' => 'yes',
+            '_stock' => $data['stock_qty'],
+            '_stock_status' => $data['stock_status'],
+            '_sc_last_sync' => current_time('mysql')
+        ];
+
+        // Add pricing
+        if ($data['price'] > 0) {
+            $meta['_regular_price'] = $data['price'];
+            $meta['_price'] = $data['price'];
+        }
+
+        // Add dimensions (no weight per user request)
+        if ($data['length'] > 0) $meta['_length'] = $data['length'];
+        if ($data['width'] > 0) $meta['_width'] = $data['width'];
+        if ($data['height'] > 0) $meta['_height'] = $data['height'];
+
+        // Set all meta at once
+        $meta_success = 0;
+        $meta_failed = 0;
+        foreach ($meta as $key => $value) {
+            $result = update_post_meta($product_id, $key, $value);
+            if ($result !== false) {
+                $meta_success++;
+            } else {
+                $meta_failed++;
+                error_log("SC Sync: Failed to set meta {$key} for product ID {$product_id}");
+            }
+        }
+        
+        error_log("SC Sync: Set {$meta_success} meta fields successfully, {$meta_failed} failed for product ID {$product_id}");
+
+        // Use WooCommerce methods for dimensions to ensure proper saving
+        if (function_exists('wc_get_product')) {
+            $product = wc_get_product($product_id);
+            if ($product) {
+                if ($data['length'] > 0) $product->set_length($data['length']);
+                if ($data['width'] > 0) $product->set_width($data['width']);
+                if ($data['height'] > 0) $product->set_height($data['height']);
+                $wc_result = $product->save();
+                error_log("SC Sync: WooCommerce product->save() returned: " . print_r($wc_result, true));
+            } else {
+                error_log("SC Sync: Could not get WooCommerce product object for ID {$product_id}");
+            }
+        }
+    }
+
+    /**
+     * Extract product data from API response
+     */
+    private function extractProductData($item) {
+        // Stock from stock_status field
+        $stock_qty = max(0, intval($item['stock_status'] ?? 0));
+        $stock_status = $stock_qty > 0 ? 'instock' : 'outofstock';
+
+        // Pricing
+        $price = floatval($item['retail_price'] ?? 0);
+
+        // Dimensions from semicolon-separated string
+        $length = $width = $height = 0;
+        if (!empty($item['dimmensions'])) {
+            $dims = explode(';', $item['dimmensions']);
+            if (count($dims) >= 3) {
+                $length = floatval(trim($dims[0] ?? 0));
+                $width = floatval(trim($dims[1] ?? 0));
+                $height = floatval(trim($dims[2] ?? 0));
+            }
+        }
+
+        return [
+            'sku' => trim($item['item_code'] ?? ''),
+            'title' => trim($item['item_description'] ?? ''),
+            'description' => trim($item['item_description'] ?? ''),
+            'stock_qty' => $stock_qty,
+            'stock_status' => $stock_status,
+            'price' => $price,
+            'length' => $length,
+            'width' => $width,
+            'height' => $height
+        ];
+    }
+
+    /**
+     * Get WooCommerce categories
+     */
+    private function getWooCommerceCategories() {
+        $categories = get_terms([
+            'taxonomy' => 'product_cat',
+            'hide_empty' => false,
+            'fields' => 'names'
+        ]);
+
+        if (is_wp_error($categories)) return [];
+
+        // Filter out default categories and ensure it's a simple indexed array
+        $filtered = array_filter($categories, function($cat) {
+            return !in_array(strtolower($cat), ['uncategorized']);
+        });
+
+        // Re-index the array to ensure it's a simple indexed array, not associative
+        return array_values($filtered);
+    }
+
+    /**
+     * Get existing products by SKUs efficiently - only PUBLISHED products
+     */
+    private function getProductsBySKUs($skus) {
+        if (empty($skus)) return [];
+
+        global $wpdb;
+        $placeholders = implode(',', array_fill(0, count($skus), '%s'));
+        
+        $results = $wpdb->get_results($wpdb->prepare("
+            SELECT p.ID as product_id, pm.meta_value as sku, p.post_status
+            FROM {$wpdb->posts} p
+            INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+            WHERE p.post_type = 'product'
+            AND p.post_status = 'publish'
+            AND pm.meta_key = '_sku'
+            AND pm.meta_value IN ({$placeholders})
+        ", $skus));
+
+        $product_map = [];
+        $status_count = [];
+        
+        foreach ($results as $row) {
+            $product_map[$row->sku] = $row->product_id;
+            $status_count[$row->post_status] = ($status_count[$row->post_status] ?? 0) + 1;
+        }
+
+        error_log("SC Sync: Found " . count($product_map) . " PUBLISHED products by SKU. Status breakdown: " . print_r($status_count, true));
+        return $product_map;
+    }
+
+    // Public methods for admin interface
+    public function getSyncStats() {
+        global $wpdb;
+        $total_products = $wpdb->get_var("
+            SELECT COUNT(*) FROM {$wpdb->posts} 
+            WHERE post_type = 'product' AND post_status = 'publish'
+        ");
+
+        return [
+            'total_products' => intval($total_products),
+            'last_sync' => get_option('sc_last_sync_time', 'Never'),
+            'last_count' => get_option('sc_last_sync_count', 0),
+            'batch_size' => $this->batch_size
+        ];
+    }
+
+    public function getRecentLogs() {
+        // Return minimal logs to reduce overhead
+        return [
+            'Last sync: ' . get_option('sc_last_sync_time', 'Never'),
+            'Products synced: ' . get_option('sc_last_sync_count', 0)
+        ];
+    }
+
+    /**
+     * NEW METHOD: Show which categories from API don't exist in WooCommerce
+     * This helps identify which categories you might want to create manually
+     */
+    public function checkMissingCategories($limit = 200) {
+        $api_id = get_option('sc_api_id');
+        if (empty($api_id)) {
+            return ['status' => false, 'message' => 'No API ID configured', 'processed' => 0];
+        }
+
+        try {
+            // Get sample of products from API to discover categories
+            $response = $this->api->productSync(
+                $api_id,
+                'P', // Partial sync just for category discovery
+                '', // No SKU filter
+                [], // All categories
+                1,
+                $limit
+            );
+
+            if (isset($response['error'])) {
+                return ['status' => false, 'message' => 'API Error: ' . $response['error'], 'processed' => 0];
+            }
+
+            $items = $response['item_catalog']['items'] ?? [];
+            if (empty($items)) {
+                return ['status' => false, 'message' => 'No items returned from API', 'processed' => 0];
+            }
+
+            // Collect all unique primary categories from API
+            $api_categories = [];
             
-            if (!$term) {
-                $term = wp_insert_term($category_name, 'product_cat', [
-                    'description' => "Products marked as {$category_name}"
-                ]);
+            foreach ($items as $item) {
+                $primary_category = trim($item['primary_category'] ?? '');
                 
-                if (is_wp_error($term)) {
-                    error_log('SC Sync: Failed to create special category ' . $category_name . ': ' . $term->get_error_message());
-                    continue;
+                if (!empty($primary_category)) {
+                    $api_categories[$primary_category] = true;
                 }
             }
-            
-            // Store the term ID for later use
-            $this->categories_map[$key] = is_array($term) ? $term['term_id'] : $term;
-            error_log('SC Sync: Special category ' . $category_name . ' setup with ID ' . $this->categories_map[$key]);
-        }
-    }
 
-    /**
-     * Create a new product
-     * 
-     * @param array $item Product data
-     * @return int|false Product ID or false on failure
-     */
-    private function createProduct($item) {
-        try {
-            // Double-check for existing product to prevent duplicates
-            $existing_product_id = $this->getProductIdBySku($item['sku']);
-            if ($existing_product_id) {
-                error_log('SC Sync: Skipped creating product SKU ' . $item['sku'] . ' - already exists with ID ' . $existing_product_id);
-                return $existing_product_id;
-            }
-
-            $product_id = wp_insert_post([
-                'post_title'   => $item['description'] ?: 'Unnamed Product',
-                'post_content' => $this->formatProductDescription($item),
-                'post_excerpt' => wp_trim_words($item['description'], 20),
-                'post_status'  => 'publish',
-                'post_type'    => 'product'
-            ]);
+            // Check which ones exist in WooCommerce
+            $missing_categories = [];
+            $existing_categories = [];
             
-            if (is_wp_error($product_id)) {
-                error_log('SC Sync - Error creating product SKU ' . $item['sku'] . ': ' . $product_id->get_error_message());
-                return false;
-            }
-            
-            update_post_meta($product_id, '_sku', $item['sku']);
-            
-            // Keep as simple product for seamless checkout integration
-            wp_set_object_terms($product_id, 'simple', 'product_type');
-            
-            // Just track the distributor ID for backend differentiation
-            update_post_meta($product_id, '_distributor', $this->distributor_id);
-            update_post_meta($product_id, '_distributor_id', $this->distributor_id);
-            
-            // Set primary category based on the API response
-            $this->setProductCategory($product_id, $item['category'], $item['description']);
-            
-            $this->setProductDimensions($product_id, $item['dimensions']);
-            
-            error_log('SC Sync: Created new product SKU ' . $item['sku'] . ' with ID ' . $product_id);
-            return $product_id;
-        } catch (Exception $e) {
-            error_log('SC Sync: Exception creating product SKU ' . $item['sku'] . ': ' . $e->getMessage());
-            return false;
-        }
-    }
-
-    /**
-     * Format product description with additional details
-     * 
-     * @param array $item Product data
-     * @return string Formatted description
-     */
-    private function formatProductDescription($item) {
-        return $item['description'];
-    }
-
-    /**
-     * Set product category based on primary_category and special characters in description
-     * 
-     * @param int $product_id Product ID
-     * @param string $category Category name from API
-     * @param string $description Product description to check for special characters
-     */
-    private function setProductCategory($product_id, $category, $description = '') {
-        try {
-            // Load categories map if not already loaded
-            if (empty($this->categories_map)) {
-                $this->categories_map = get_option('sc_distributor_categories_' . $this->distributor_id, []);
-                $this->ensureSpecialCategoriesExist();
-            }
-            
-            // Get current categories for this product
-            $current_terms = wp_get_object_terms($product_id, 'product_cat', ['fields' => 'ids']);
-            if (is_wp_error($current_terms)) {
-                $current_terms = [];
-            }
-            
-            // Determine if product should be in any special categories
-            $special_term_ids = [];
-            foreach ($this->special_categories as $key => $special_char) {
-                if (strpos($description, $special_char) !== false) {
-                    if (isset($this->categories_map[$key])) {
-                        $special_term_ids[] = (int)$this->categories_map[$key];
-                        error_log('SC Sync: Product ID ' . $product_id . ' added to special category: ' . $key);
-                    }
-                }
-            }
-            
-            // Handle primary category assignment
-            $primary_term_id = 0;
-            
-            if (!empty($category)) {
-                // Check if the primary_category matches any predefined category
-                if (isset($this->categories_map[$category])) {
-                    // Direct match found
-                    $primary_term_id = (int)$this->categories_map[$category];
-                    error_log('SC Sync: Primary category match found for product ID ' . $product_id . ': ' . $category);
+            foreach (array_keys($api_categories) as $category_name) {
+                if ($this->categoryExists($category_name)) {
+                    $existing_categories[] = $category_name;
                 } else {
-                    // Try partial matches
-                    foreach ($this->categories_map as $defined_category => $term_id) {
-                        // Skip special categories in this loop
-                        if (in_array($defined_category, ['special', 'back_in_stock', 'new'])) {
-                            continue;
-                        }
-                        
-                        // Check for partial matches
-                        if (stripos($category, $defined_category) !== false || 
-                            stripos($defined_category, $category) !== false) {
-                            $primary_term_id = (int)$term_id;
-                            error_log('SC Sync: Partial category match found for product ID ' . $product_id . ': ' . $defined_category);
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            // Combine primary category with special categories
-            $new_term_ids = $special_term_ids;
-            if ($primary_term_id > 0) {
-                $new_term_ids[] = $primary_term_id;
-            }
-            
-            // If no categories assigned, use default uncategorized
-            if (empty($new_term_ids)) {
-                $uncategorized_term = get_term_by('slug', 'uncategorized', 'product_cat');
-                if ($uncategorized_term) {
-                    $new_term_ids[] = (int)$uncategorized_term->term_id;
-                    error_log('SC Sync: No category matches found, setting product ID ' . $product_id . ' to uncategorized');
-                }
-            }
-            
-            // Update the product categories
-            wp_set_object_terms($product_id, $new_term_ids, 'product_cat');
-            
-            error_log('SC Sync: Set categories for product ID ' . $product_id . ': ' . implode(', ', $new_term_ids));
-        } catch (Exception $e) {
-            error_log('SC Sync: Exception setting category for product ID ' . $product_id . ': ' . $e->getMessage());
-        }
-    }
-
-
-/**
- * Set product dimensions as attributes and shipping properties
- * 
- * @param int $product_id Product ID
- * @param string $dimensions Dimensions string
- */
-    private function setProductDimensions($product_id, $dimensions) {
-        if (empty($dimensions)) {
-            return;
-        }
-    
-        $dims = explode(';', trim($dimensions, ';'));
-        if (count($dims) < 3) {
-            error_log('SC Sync: Invalid dimensions format for product ID ' . $product_id . ': ' . $dimensions);
-            return;
-        }
-    
-        // Set as custom attributes for display
-        $attributes = [
-            'length' => [
-                'name' => 'Length',
-                'value' => floatval($dims[0]) . '"',
-                'position' => 0,
-                'is_visible' => 1,
-                'is_variation' => 0,
-                'is_taxonomy' => 0
-            ],
-            'width' => [
-                'name' => 'Width',
-                'value' => floatval($dims[1]) . '"',
-                'postion' => 1,
-                'is_visible' => 1,
-                'is_variation' => 0,
-                'is_taxonomy' => 0
-            ],
-            'height' => [
-                'name' => 'Height',
-                'value' => floatval($dims[2]) . '"',
-                'position' => 2,
-                'is_visible' => 1,
-                'is_variation' => 0,
-                'is_taxonomy' => 0
-            ]
-        ];
-    
-        update_post_meta($product_id, '_product_attributes', $attributes);
-        
-        // Set shipping dimensions
-        update_post_meta($product_id, '_length', floatval($dims[0]));
-        update_post_meta($product_id, '_width', floatval($dims[1]));
-        update_post_meta($product_id, '_height', floatval($dims[2]));
-        
-        // Add weight  
-        if (isset($dims[3]) && is_numeric($dims[3])) {
-            $weight = floatval($dims[3]);
-            update_post_meta($product_id, '_weight', $weight);
-        }
-    }
-
-    /**
-     * Update an existing product
-     * 
-     * @param int $product_id Product ID
-     * @param array $item Product data
-     * @param bool $full_sync Whether to perform a full update
-     */
-    private function updateProduct($product_id, $item, $full_sync) {
-        try {
-            $is_distributor_product = get_post_meta($product_id, '_distributor', true) === $this->distributor_id;
-
-            // Always update stock regardless of sync type
-            wc_update_product_stock($product_id, $item['stock']);
-            update_post_meta($product_id, '_stock_status', $item['stock'] > 0 ? 'instock' : 'outofstock');
-            
-            if ($is_distributor_product || empty(get_post_meta($product_id, '_distributor', true))) {
-                update_post_meta($product_id, '_distributor', $this->distributor_id);
-                update_post_meta($product_id, '_distributor_id', $this->distributor_id);
-                
-                // Ensure it's a simple product type for seamless checkout
-                wp_set_object_terms($product_id, 'simple', 'product_type');
-            }
-            
-            if (!empty($item['retail_price'])) {
-                update_post_meta($product_id, '_regular_price', $item['retail_price']);
-                update_post_meta($product_id, '_price', $item['retail_price']);
-            }
-            
-            // Only update other fields during full sync
-            if ($full_sync) {
-                // Use direct updates rather than WC_Product object to save memory
-                wp_update_post([
-                    'ID' => $product_id,
-                    'post_title' => $item['description'],
-                    'post_content' => $this->formatProductDescription($item),
-                    'post_excerpt' => wp_trim_words($item['description'], 20)
-                ]);
-                
-                // Only update image if needed
-                if (!has_post_thumbnail($product_id)) {
-                    $this->setProductImage($product_id, $item['sku'], $item['image_url']);
-                }
-                
-                if ($is_distributor_product || empty(get_post_meta($product_id, '_distributor', true))) {
-                    // Update categories based on description and primary category
-                    $this->setProductCategory($product_id, $item['category'], $item['description']);
-                }
-                
-                $this->setProductDimensions($product_id, $item['dimensions']);
-            }
-        } catch (Exception $e) {
-            error_log('SC Sync: Exception updating product ID ' . $product_id . ': ' . $e->getMessage());
-        }
-    }
-
-    /**
-     * Set product featured image
-     * Optimized to check existence first before attempting to download
-     * With additional safety checks and error handling for missing images
-     * 
-     * @param int $product_id Product ID
-     * @param string $sku Product SKU
-     * @param string $image_url Image URL
-     */
-    private function setProductImage($product_id, $sku, $image_url) {
-        // Set a timeout just for this operation
-        $original_time_limit = ini_get('max_execution_time');
-        set_time_limit(30); // Ensure we have enough time but won't hang forever
-        
-        try {
-            // Skip if product already has an image
-            if (has_post_thumbnail($product_id)) {
-                return;
-            }
-
-            // Try to find existing image before downloading
-            $existing_image_id = $this->findExistingImage($sku);
-            if ($existing_image_id) {
-                set_post_thumbnail($product_id, $existing_image_id);
-                return;
-            }
-            
-            // Skip if URL is invalid
-            if (empty($image_url) || !filter_var($image_url, FILTER_VALIDATE_URL)) {
-                error_log('SC Sync: Invalid image URL for product ID ' . $product_id . ': ' . $image_url);
-                return;
-            }
-
-            // First check if the image exists on the server with a HEAD request
-            $args = [
-                'method' => 'HEAD',
-                'timeout' => 3,
-                'redirection' => 3,
-                'sslverify' => false
-            ];
-            
-            $response = wp_remote_request($image_url, $args);
-            
-            // If the HEAD request fails or returns non-200 status, skip download attempt
-            if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
-                error_log('SC Sync: Image not found for product ID ' . $product_id . ' at URL: ' . $image_url);
-                return;
-            }
-            
-            // Only download and process image if it exists
-            $image_id = $this->uploadImageFromUrl($image_url);
-            if ($image_id) {
-                set_post_thumbnail($product_id, $image_id);
-            }
-        } catch (Exception $e) {
-            error_log('SC Sync: Exception setting image for product ID ' . $product_id . ': ' . $e->getMessage());
-        } finally {
-            // Restore original time limit
-            set_time_limit($original_time_limit);
-        }
-    }
-
-    /**
-     * Find existing product image
-     * 
-     * @param string $sku Product SKU
-     * @return int|false Attachment ID or false
-     */
-    private function findExistingImage($sku) {
-        // More efficient query to find existing image
-        global $wpdb;
-        $attachment_id = $wpdb->get_var($wpdb->prepare(
-            "SELECT post_id FROM $wpdb->postmeta 
-            WHERE meta_key = '_wp_attached_file' 
-            AND meta_value LIKE %s 
-            LIMIT 1",
-            '%' . $wpdb->esc_like($sku) . '%'
-        ));
-        
-        return $attachment_id ? (int)$attachment_id : false;
-    }
-
-    /**
-     * Upload image from URL
-     * 
-     * @param string $image_url Image URL
-     * @return int|false Attachment ID or false
-     */
-    private function uploadImageFromUrl($image_url) {
-        try {
-            $image_name = basename($image_url);
-            $upload_dir = wp_upload_dir();
-            $image_path = $upload_dir['path'] . '/' . $image_name;
-
-            // Check if file already exists
-            if (file_exists($image_path)) {
-                $attachment = $this->getAttachmentFromPath($image_path);
-                if ($attachment) {
-                    return $attachment;
+                    $missing_categories[] = $category_name;
                 }
             }
 
-            // Use WordPress HTTP API with lower timeout
-            $response = wp_remote_get($image_url, [
-                'timeout' => 5, 
-                'sslverify' => false,
-                'user-agent' => 'WordPress/' . get_bloginfo('version')
-            ]);
-            
-            if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
-                error_log('SC Sync: Failed to download image: ' . $image_url);
-                return false;
-            }
+            error_log("SC Sync: Category Analysis - Missing: " . implode(', ', $missing_categories));
+            error_log("SC Sync: Category Analysis - Existing: " . implode(', ', $existing_categories));
 
-            $image_data = wp_remote_retrieve_body($response);
-            if (empty($image_data)) {
-                error_log('SC Sync: Empty image data from URL: ' . $image_url);
-                return false;
-            }
-
-            // Verify the image data is valid before saving
-            if (!$this->isValidImageData($image_data)) {
-                error_log('SC Sync: Invalid image data from URL: ' . $image_url);
-                return false;
-            }
-
-            // Save file to disk
-            file_put_contents($image_path, $image_data);
-            
-            // Check and validate file type
-            $filetype = wp_check_filetype($image_path, null);
-            if (!$filetype['type'] || strpos($filetype['type'], 'image/') !== 0) {
-                error_log('SC Sync: Invalid file type for image: ' . $image_url);
-                if (file_exists($image_path)) {
-                    unlink($image_path);
-                }
-                return false;
-            }
-
-            // Prepare attachment data
-            $attachment = [
-                'post_mime_type' => $filetype['type'],
-                'post_title'     => sanitize_file_name($image_name),
-                'post_content'   => '',
-                'post_status'    => 'inherit'
+            return [
+                'status' => true,
+                'message' => "Category analysis complete",
+                'processed' => count($items),
+                'missing' => $missing_categories,
+                'existing' => $existing_categories
             ];
 
-            // Insert attachment
-            $attach_id = wp_insert_attachment($attachment, $image_path);
-            if (is_wp_error($attach_id)) {
-                if (file_exists($image_path)) {
-                    unlink($image_path);
-                }
-                return false;
-            }
-
-            // Set timeout limit specifically for image processing
-            $original_time_limit = ini_get('max_execution_time');
-            set_time_limit(60); // Increase to 60 seconds just for image processing
-            
-            try {
-                // Generate metadata and thumbnails with error handling
-                require_once ABSPATH . 'wp-admin/includes/image.php';
-                $attach_data = wp_generate_attachment_metadata($attach_id, $image_path);
-                
-                // If metadata generation fails, clean up and return false
-                if (empty($attach_data)) {
-                    wp_delete_attachment($attach_id, true);
-                    error_log('SC Sync: Failed to generate attachment metadata for: ' . $image_url);
-                    return false;
-                }
-                
-                wp_update_attachment_metadata($attach_id, $attach_data);
-            } catch (Exception $e) {
-                error_log('SC Sync: Exception during image processing: ' . $e->getMessage());
-                wp_delete_attachment($attach_id, true);
-                return false;
-            } finally {
-                // Restore original time limit
-                set_time_limit($original_time_limit);
-            }
-
-            return $attach_id;
         } catch (Exception $e) {
-            error_log('SC Sync: Exception uploading image: ' . $e->getMessage());
-            return false;
+            error_log('SC Check Categories Error: ' . $e->getMessage());
+            return ['status' => false, 'message' => 'Error: ' . $e->getMessage(), 'processed' => 0];
         }
     }
-    
-    /**
-     * Check if data is a valid image
-     * 
-     * @param string $data Image data
-     * @return bool Whether data is a valid image
-     */
-    private function isValidImageData($data) {
-        // Quick check for image signatures
-        $signatures = [
-            "\xFF\xD8\xFF" => 'image/jpeg',  // JPEG
-            "\x89\x50\x4E\x47\x0D\x0A\x1A\x0A" => 'image/png', // PNG
-            "GIF87a" => 'image/gif', // GIF
-            "GIF89a" => 'image/gif', // GIF
-        ];
-        
-        foreach ($signatures as $hex => $mime) {
-            if (strncmp($data, $hex, strlen($hex)) === 0) {
-                return true;
-            }
-        }
-        
-        // If no valid signature found, likely not an image
-        return false;
-    }
-    
-    /**
-     * Get attachment ID from file path
-     * 
-     * @param string $path File path
-     * @return int|false Attachment ID or false
-     */
-    private function getAttachmentFromPath($path) {
-        try {
-            // More efficient direct query
-            global $wpdb;
-            $upload_dir = wp_upload_dir();
-            $relative_path = str_replace($upload_dir['basedir'] . '/', '', $path);
-            
-            $attachment_id = $wpdb->get_var($wpdb->prepare(
-                "SELECT post_id FROM $wpdb->postmeta 
-                WHERE meta_key = '_wp_attached_file' 
-                AND meta_value = %s 
-                LIMIT 1", 
-                $relative_path
-            ));
-            
-            return $attachment_id ? (int)$attachment_id : false;
-        } catch (Exception $e) {
-            error_log('SC Sync: Exception getting attachment: ' . $e->getMessage());
-            return false;
-        }
+
+    // Backward compatibility
+    public function syncProductsInChunks($full_sync = true, $force_sync = false, $rows_per_request = null) {
+        return $this->syncProducts($force_sync);
     }
 }

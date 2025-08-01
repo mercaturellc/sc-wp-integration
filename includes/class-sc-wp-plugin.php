@@ -1,220 +1,172 @@
 <?php
 
 /**
- * The file that defines the core plugin class
- *
- * A class definition that includes attributes and functions used across both the
- * public-facing side of the site and the admin area.
- *
- * @link       https://gitlab.com/mercature/sc-wp-integration
- * @since      1.0.0
- *
- * @package    SC_Wp_Plugin
- * @subpackage SC_Wp_Plugin/includes
- */
-
-/**
- * The core plugin class.
- *
- * This is used to define internationalization, admin-specific hooks, and
- * public-facing site hooks.
- *
- * Also maintains the unique identifier of this plugin as well as the current
- * version of the plugin.
- *
- * @since      1.0.0
- * @package    SC_Wp_Plugin
- * @subpackage SC_Wp_Plugin/includes
- * @author     Trent Mercer <trent@mercature.net>
+ * SIMPLIFIED core plugin class - optimized for performance
  */
 class SC_Wp_Plugin {
+    protected $loader;
+    protected $plugin_name;
+    protected $version;
+    protected $api;
+    protected $sync; // Lazy loaded only when needed
 
-	/**
-	 * The loader that's responsible for maintaining and registering all hooks that power
-	 * the plugin.
-	 *
-	 * @since    1.0.0
-	 * @access   protected
-	 * @var      SC_Wp_Plugin_Loader    $loader    Maintains and registers all hooks for the plugin.
-	 */
-	protected $loader;
+    public function __construct() {
+        if (defined('SC_WP_PLUGIN_VERSION')) {
+            $this->version = SC_WP_PLUGIN_VERSION;
+        } else {
+            $this->version = '1.0.0';
+        }
+        $this->plugin_name = 'sc-wp-plugin';
 
-	/**
-	 * The unique identifier of this plugin.
-	 *
-	 * @since    1.0.0
-	 * @access   protected
-	 * @var      string    $plugin_name    The string used to uniquely identify this plugin.
-	 */
-	protected $plugin_name;
+        $this->load_dependencies();
+        $this->set_locale();
 
-	/**
-	 * The current version of the plugin.
-	 *
-	 * @since    1.0.0
-	 * @access   protected
-	 * @var      string    $version    The current version of the plugin.
-	 */
-	protected $version;
+        // Only initialize lightweight API class
+        $this->api = new SC_API();
 
-	/**
-	 * Define the core functionality of the plugin.
-	 *
-	 * Set the plugin name and the plugin version that can be used throughout the plugin.
-	 * Load the dependencies, define the locale, and set the hooks for the admin area and
-	 * the public-facing side of the site.
-	 *
-	 * @since    1.0.0
-	 */
-	public function __construct() {
-		if ( defined( 'SC_WP_PLUGIN_VERSION' ) ) {
-			$this->version = SC_WP_PLUGIN_VERSION;
-		} else {
-			$this->version = '1.0.0';
-		}
-		$this->plugin_name = 'sc-wp-plugin';
+        // ONLY hook admin functionality if in admin
+        if (is_admin()) {
+            $this->define_admin_hooks();
+        }
+        
+        // ONLY hook order processing if WooCommerce is active
+        if (class_exists('WooCommerce')) {
+            $this->define_order_hooks();
+        }
 
-		$this->load_dependencies();
-		$this->set_locale();
+        $this->define_sync_hooks();
+    }
 
-		$this->api = new SC_API();
+    private function load_dependencies() {
+        // Core classes only
+        require plugin_dir_path(dirname(__FILE__)) . 'includes/class-sc-api.php';
+        require_once plugin_dir_path(dirname(__FILE__)) . 'includes/class-sc-wp-plugin-loader.php';
+        require_once plugin_dir_path(dirname(__FILE__)) . 'includes/class-sc-wp-plugin-i18n.php';
 
-		$this->define_admin_hooks();
-		$this->define_public_hooks();
-	}
+        // Admin classes only loaded if in admin
+        if (is_admin()) {
+            require_once plugin_dir_path(dirname(__FILE__)) . 'admin/class-sc-wp-plugin-admin.php';
+            require_once plugin_dir_path(dirname(__FILE__)) . 'admin/class-sc-wp-plugin-admin-view.php';
+        }
 
-	/**
-	 * Load the required dependencies for this plugin.
-	 *
-	 * Include the following files that make up the plugin:
-	 *
-	 * - SC_Wp_Plugin_Loader. Orchestrates the hooks of the plugin.
-	 * - SC_Wp_Plugin_i18n. Defines internationalization functionality.
-	 * - SC_Wp_Plugin_Admin. Defines all hooks for the admin area.
-	 * - SC_Wp_Plugin_Public. Defines all hooks for the public side of the site.
-	 *
-	 * Create an instance of the loader which will be used to register the hooks
-	 * with WordPress.
-	 *
-	 * @since    1.0.0
-	 * @access   private
-	 */
-	private function load_dependencies() {
+        $this->loader = new SC_Wp_Plugin_Loader();
+    }
 
-		require plugin_dir_path( dirname(__FILE__) ) . 'includes/class-sc-api.php';
+    private function set_locale() {
+        $plugin_i18n = new SC_Wp_Plugin_i18n();
+        $this->loader->add_action('plugins_loaded', $plugin_i18n, 'load_plugin_textdomain');
+    }
 
-		/**
-		 * The class responsible for orchestrating the actions and filters of the
-		 * core plugin.
-		 */
-		require_once plugin_dir_path( dirname( __FILE__ ) ) . 'includes/class-sc-wp-plugin-loader.php';
+    private function define_admin_hooks() {
+        $plugin_admin = new SC_Wp_Plugin_Admin($this->get_plugin_name(), $this->get_version(), $this->api, $this);
+        
+        $this->loader->add_action('admin_enqueue_scripts', $plugin_admin, 'enqueue_assets');
+        $this->loader->add_action('admin_menu', $plugin_admin, 'add_admin_menu');
+        $this->loader->add_action('admin_init', $plugin_admin, 'register_settings');
+        $this->loader->add_action('admin_notices', $plugin_admin, 'show_admin_notices');
 
-		/**
-		 * The class responsible for defining internationalization functionality
-		 * of the plugin.
-		 */
-		require_once plugin_dir_path( dirname( __FILE__ ) ) . 'includes/class-sc-wp-plugin-i18n.php';
+        // AJAX handlers
+        $this->loader->add_action('wp_ajax_sc_run_sync', $plugin_admin, 'ajax_run_sync');
+        $this->loader->add_action('wp_ajax_sc_get_status', $plugin_admin, 'ajax_get_status');
+    }
 
-		/**
-		 * The class responsible for defining all actions that occur in the admin area.
-		 */
-		require_once plugin_dir_path( dirname( __FILE__ ) ) . 'admin/class-sc-wp-plugin-admin.php';
+    private function define_order_hooks() {
+        // Order processing hooks - only if WooCommerce is active
+        $this->loader->add_action('woocommerce_checkout_order_processed', $this, 'process_new_order', 10, 3);
+    }
 
-		/**
-		 * The class responsible for defining all actions that occur in the public-facing
-		 * side of the site.
-		 */
-		require_once plugin_dir_path( dirname( __FILE__ ) ) . 'public/class-sc-wp-plugin-public.php';
+    private function define_sync_hooks() {
+        // SIMPLIFIED: Only daily sync
+        $this->loader->add_action('SC_WP_daily_sync', $this, 'run_daily_sync');
+        $this->loader->add_action('init', $this, 'setup_daily_sync');
+    }
 
-		$this->loader = new SC_Wp_Plugin_Loader();
+    public function setup_daily_sync() {
+        if (!get_option('sc_api_id', '')) {
+            return; // No API ID configured
+        }
 
-	}
+        // Clear old frequent sync schedules if they exist
+        wp_clear_scheduled_hook('SC_WP_scheduled_stock_sync');
+        wp_clear_scheduled_hook('SC_WP_scheduled_full_sync');
 
-	/**
-	 * Define the locale for this plugin for internationalization.g
-	 *
-	 * Uses the SC_Wp_Plugin_i18n class in order to set the domain and to register the hook
-	 * with WordPress.
-	 *
-	 * @since    1.0.0
-	 * @access   private
-	 */
-	private function set_locale() {
+        // Setup simple daily sync at 3 AM
+        if (!wp_next_scheduled('SC_WP_daily_sync')) {
+            $tomorrow_3am = strtotime('tomorrow 3:00 AM');
+            wp_schedule_event($tomorrow_3am, 'daily', 'SC_WP_daily_sync');
+        }
+    }
 
-		$plugin_i18n = new SC_Wp_Plugin_i18n();
+    public function run_daily_sync() {
+        // Only run if auto-sync is enabled
+        if (get_option('sc_auto_sync_enabled', 'yes') !== 'yes') {
+            return;
+        }
 
-		$this->loader->add_action( 'plugins_loaded', $plugin_i18n, 'load_plugin_textdomain' );
+        try {
+            error_log('SC: Starting daily sync');
+            
+            $sync = $this->get_sync();
+            if (!$sync) {
+                error_log('SC: Daily sync failed - sync not available');
+                return;
+            }
 
-	}
+            $result = $sync->syncProducts(false);
+            
+            if ($result['status']) {
+                error_log('SC: Daily sync completed - processed ' . $result['processed'] . ' items');
+                update_option('sc_last_sync_time', current_time('mysql'));
+                update_option('sc_last_sync_count', $result['processed']);
+            } else {
+                error_log('SC: Daily sync failed: ' . $result['message']);
+            }
+            
+        } catch (Exception $e) {
+            error_log('SC: Daily sync exception: ' . $e->getMessage());
+        }
+    }
 
-	/**
-	 * Register all of the hooks related to the admin area functionality
-	 * of the plugin.
-	 *
-	 * @since    1.0.0
-	 * @access   private
-	 */
-	private function define_admin_hooks() {
+    public function process_new_order($order_id, $posted_data, $order) {
+        // Simple order processing
+        try {
+            if (!class_exists('SC_WP_Shop_Order')) {
+                require plugin_dir_path(dirname(__FILE__)) . 'includes/class-sc-wp-shop-order.php';
+            }
+            
+            $order_processor = new SC_WP_Shop_Order($this->api);
+            $order_processor->orderProcess($order_id);
+            
+        } catch (Exception $e) {
+            error_log("SC: Order processing failed for order {$order_id}: " . $e->getMessage());
+        }
+    }
 
-		$plugin_admin = new SC_Wp_Plugin_Admin( $this->get_plugin_name(), $this->get_version(), $this->api );
+    /**
+     * LAZY LOAD sync instance only when needed
+     */
+    public function get_sync() {
+        if ($this->sync === null) {
+            // Only load sync classes when actually needed
+            if (!class_exists('SC_WP_Shop_Sync_Utils')) {
+                require plugin_dir_path(dirname(__FILE__)) . 'includes/class-sc-wp-shop-sync-utils.php';
+            }
+            if (!class_exists('SC_WP_Shop_Sync')) {
+                require plugin_dir_path(dirname(__FILE__)) . 'includes/class-sc-wp-shop-sync.php';
+            }
+            
+            $this->sync = new SC_WP_Shop_Sync($this->api);
+        }
+        return $this->sync;
+    }
 
-		$this->loader->add_action( 'admin_enqueue_scripts', $plugin_admin, 'enqueue_styles' );
-		$this->loader->add_action( 'admin_enqueue_scripts', $plugin_admin, 'enqueue_scripts' );
-	}
+    // Simple getters
+    public function get_api() { return $this->api; }
+    public function get_plugin_name() { return $this->plugin_name; }
+    public function get_loader() { return $this->loader; }
+    public function get_version() { return $this->version; }
 
-	/**
-	 * Register all of the hooks related to the public-facing functionality
-	 * of the plugin.
-	 *
-	 * @since    1.0.0
-	 * @access   private
-	 */
-	private function define_public_hooks() {
-
-		$plugin_public = new SC_Wp_Plugin_Public( $this->get_plugin_name(), $this->get_version() );
-
-		$this->loader->add_action( 'wp_enqueue_scripts', $plugin_public, 'enqueue_styles' );
-		$this->loader->add_action( 'wp_enqueue_scripts', $plugin_public, 'enqueue_scripts' );
-
-	}
-
-	/**
-	 * The name of the plugin used to uniquely identify it within the context of
-	 * WordPress and to define internationalization functionality.
-	 *
-	 * @since     1.0.0
-	 * @return    string    The name of the plugin.
-	 */
-	public function get_plugin_name() {
-		return $this->plugin_name;
-	}
-
-	/**
-	 * The reference to the class that orchestrates the hooks with the plugin.
-	 *
-	 * @since     1.0.0
-	 * @return    SC_Wp_Plugin_Loader    Orchestrates the hooks of the plugin.
-	 */
-	public function get_loader() {
-		return $this->loader;
-	}
-
-	/**
-	 * Retrieve the version number of the plugin.
-	 *
-	 * @since     1.0.0
-	 * @return    string    The version number of the plugin.
-	 */
-	public function get_version() {
-		return $this->version;
-	}
-
-	/**
-	 * Run the loader to execute all of the hooks with WordPress.
-	 *
-	 * @since    1.0.0
-	 */
-	public function run() {
-		$this->loader->run();	
-	}
+    public function run() {
+        $this->loader->run();
+    }
 }
